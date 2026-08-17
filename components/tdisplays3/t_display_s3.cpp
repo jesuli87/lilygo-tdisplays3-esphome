@@ -3,19 +3,6 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_memory_utils.h"
-
-// ST7789 command set
-#define ST7789_SWRESET 0x01
-#define ST7789_SLPOUT  0x11
-#define ST7789_COLMOD  0x3A
-#define ST7789_MADCTL  0x36
-#define ST7789_CASET   0x2A
-#define ST7789_RASET   0x2B
-#define ST7789_INVON   0x21
-#define ST7789_NORON   0x13
-#define ST7789_DISPON  0x29
-#define ST7789_RAMWR   0x2C
 
 namespace esphome {
 namespace tdisplays3 {
@@ -24,61 +11,44 @@ static const char *const TAG = "TDisplayS3";
 
 constexpr int TDisplayS3::DATA_PINS[8];
 
-void TDisplayS3::push_frame_() {
-  // Set address window every frame (avoids pointer drift)
-  {
-    uint8_t d[] = {0x00, (uint8_t)COL_OFFSET,
-                   0x00, (uint8_t)(COL_OFFSET + width_ - 1)};
-    send_command_data_(ST7789_CASET, d, sizeof(d));
-  }
-  {
-    uint8_t d[] = {0x00, 0x00,
-                   (uint8_t)((height_ - 1) >> 8), (uint8_t)((height_ - 1) & 0xFF)};
-    send_command_data_(ST7789_RASET, d, sizeof(d));
-  }
-  esp_err_t ret = esp_lcd_panel_io_tx_color(io_handle_, ST7789_RAMWR, fb_,
-                                            (size_t)width_ * height_ * sizeof(uint16_t));
-  if (ret != ESP_OK)
-    ESP_LOGE(TAG, "tx_color failed: %s", esp_err_to_name(ret));
-}
-
 void TDisplayS3::setup() {
   size_t fb_bytes = (size_t)width_ * height_ * sizeof(uint16_t);
 
-  // Try DMA-capable internal SRAM first
   fb_ = (uint16_t *)heap_caps_malloc(fb_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
   if (fb_) {
     ESP_LOGI(TAG, "Framebuffer: internal SRAM (%zu bytes)", fb_bytes);
   } else {
-    // Fallback: PSRAM. On ESP32-S3 GDMA can read PSRAM, but flag it so we know.
     fb_ = (uint16_t *)heap_caps_malloc(fb_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (fb_) {
+    if (fb_)
       ESP_LOGW(TAG, "Framebuffer: PSRAM (%zu bytes) — DMA may not work", fb_bytes);
-    }
   }
   if (!fb_) {
-    ESP_LOGE(TAG, "Failed to allocate %zu-byte framebuffer", fb_bytes);
+    ESP_LOGE(TAG, "Framebuffer allocation failed (%zu bytes)", fb_bytes);
     this->mark_failed();
     return;
   }
   memset(fb_, 0, fb_bytes);
 
-  // RD pin held HIGH (write-only parallel mode)
+  // RD pin held HIGH (parallel write-only mode)
   gpio_config_t rd_cfg = {};
   rd_cfg.pin_bit_mask = 1ULL << RD_PIN;
   rd_cfg.mode = GPIO_MODE_OUTPUT;
   gpio_config(&rd_cfg);
   gpio_set_level((gpio_num_t)RD_PIN, 1);
 
-  // Create Intel 8080 bus
+  // I80 bus
   esp_lcd_i80_bus_config_t bus_cfg = {};
-  bus_cfg.dc_gpio_num  = DC_PIN;
-  bus_cfg.wr_gpio_num  = WR_PIN;
-  bus_cfg.clk_src      = LCD_CLK_SRC_DEFAULT;
-  bus_cfg.bus_width    = 8;
+  bus_cfg.dc_gpio_num        = DC_PIN;
+  bus_cfg.wr_gpio_num        = WR_PIN;
+  bus_cfg.clk_src            = LCD_CLK_SRC_DEFAULT;
+  bus_cfg.bus_width          = 8;
   bus_cfg.max_transfer_bytes = fb_bytes + 64;
+  bus_cfg.dma_burst_size     = 64;
   for (int i = 0; i < 8; i++)
     bus_cfg.data_gpio_nums[i] = DATA_PINS[i];
+  // Mark unused upper-byte data pins as unused (-1)
+  for (int i = 8; i < SOC_LCD_I80_BUS_WIDTH; i++)
+    bus_cfg.data_gpio_nums[i] = -1;
 
   esp_err_t err = esp_lcd_new_i80_bus(&bus_cfg, &i80_bus_);
   if (err != ESP_OK) {
@@ -87,15 +57,14 @@ void TDisplayS3::setup() {
     return;
   }
 
-  // Attach panel IO
+  // Panel IO
   esp_lcd_panel_io_i80_config_t io_cfg = {};
-  io_cfg.cs_gpio_num       = CS_PIN;
-  io_cfg.pclk_hz           = 20 * 1000 * 1000;
-  io_cfg.trans_queue_depth  = 10;
-  io_cfg.lcd_cmd_bits      = 8;
-  io_cfg.lcd_param_bits    = 8;
-  // Byte-swap each RGB565 word: host is little-endian, ST7789 expects big-endian
-  io_cfg.flags.swap_color_bytes = 1;
+  io_cfg.cs_gpio_num              = CS_PIN;
+  io_cfg.pclk_hz                  = 10 * 1000 * 1000;  // 10 MHz (within ST7789V 66ns cycle spec)
+  io_cfg.trans_queue_depth        = 10;
+  io_cfg.lcd_cmd_bits             = 8;
+  io_cfg.lcd_param_bits           = 8;
+  io_cfg.flags.swap_color_bytes   = 1;  // RGB565: host little-endian → display big-endian
 
   err = esp_lcd_new_panel_io_i80(i80_bus_, &io_cfg, &io_handle_);
   if (err != ESP_OK) {
@@ -104,78 +73,41 @@ void TDisplayS3::setup() {
     return;
   }
 
-  // Hardware reset
-  gpio_config_t rst_cfg = {};
-  rst_cfg.pin_bit_mask = 1ULL << RST_PIN;
-  rst_cfg.mode = GPIO_MODE_OUTPUT;
-  gpio_config(&rst_cfg);
-  gpio_set_level((gpio_num_t)RST_PIN, 0);
-  vTaskDelay(pdMS_TO_TICKS(20));
-  gpio_set_level((gpio_num_t)RST_PIN, 1);
-  vTaskDelay(pdMS_TO_TICKS(150));
+  // ST7789 vendor panel driver — handles reset timing, SWRESET/SLPOUT/COLMOD/MADCTL/DISPON
+  esp_lcd_panel_dev_config_t panel_cfg = {};
+  panel_cfg.reset_gpio_num  = RST_PIN;
+  panel_cfg.rgb_endian      = LCD_RGB_ENDIAN_RGB;  // matches TFT_RGB_ORDER=TFT_RGB
+  panel_cfg.bits_per_pixel  = 16;
 
-  // ST7789V init — matches INIT_SEQUENCE_3 + CGRAM_OFFSET + INVERSION_ON
-  send_command_(ST7789_SWRESET);
-  vTaskDelay(pdMS_TO_TICKS(150));
-
-  send_command_(ST7789_SLPOUT);
-  vTaskDelay(pdMS_TO_TICKS(120));   // ST7789 datasheet: min 120 ms after sleep-out
-
-  { uint8_t d[] = {0x55}; send_command_data_(ST7789_COLMOD, d, sizeof(d)); }  // 16-bit
-  vTaskDelay(pdMS_TO_TICKS(10));
-
-  { uint8_t d[] = {0x00}; send_command_data_(ST7789_MADCTL, d, sizeof(d)); }  // portrait, RGB
-
-  // Porch control (improves reliability on many ST7789V panels)
-  { uint8_t d[] = {0x0C, 0x0C, 0x00, 0x33, 0x33}; send_command_data_(0xB2, d, sizeof(d)); }
-  // Gate control
-  { uint8_t d[] = {0x35}; send_command_data_(0xB7, d, sizeof(d)); }
-  // VCOM
-  { uint8_t d[] = {0x19}; send_command_data_(0xBB, d, sizeof(d)); }
-  // LCM control
-  { uint8_t d[] = {0x2C}; send_command_data_(0xC0, d, sizeof(d)); }
-  // VDV and VRH command enable
-  { uint8_t d[] = {0x01}; send_command_data_(0xC2, d, sizeof(d)); }
-  // VRH set
-  { uint8_t d[] = {0x12}; send_command_data_(0xC3, d, sizeof(d)); }
-  // VDV set
-  { uint8_t d[] = {0x20}; send_command_data_(0xC4, d, sizeof(d)); }
-  // Frame rate: 60 Hz
-  { uint8_t d[] = {0x0F}; send_command_data_(0xC6, d, sizeof(d)); }
-  // Power control
-  { uint8_t d[] = {0xA4, 0xA1}; send_command_data_(0xD0, d, sizeof(d)); }
-
-  // CASET: column 35–204 (170-pixel panel at +35 on 240-wide controller)
-  {
-    uint8_t d[] = {0x00, (uint8_t)COL_OFFSET,
-                   0x00, (uint8_t)(COL_OFFSET + width_ - 1)};
-    send_command_data_(ST7789_CASET, d, sizeof(d));
-  }
-  // RASET: row 0–319
-  {
-    uint8_t d[] = {0x00, 0x00,
-                   (uint8_t)((height_ - 1) >> 8), (uint8_t)((height_ - 1) & 0xFF)};
-    send_command_data_(ST7789_RASET, d, sizeof(d));
+  err = esp_lcd_new_panel_st7789(io_handle_, &panel_cfg, &panel_handle_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Panel create failed: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
   }
 
-  send_command_(ST7789_INVON);
-  vTaskDelay(pdMS_TO_TICKS(10));
+  // Bring up the display
+  esp_lcd_panel_reset(panel_handle_);   // RST LOW→HIGH + stabilisation
+  esp_lcd_panel_init(panel_handle_);    // SWRESET→SLPOUT→COLMOD→MADCTL→DISPON (with proper delays)
 
-  send_command_(ST7789_NORON);
-  vTaskDelay(pdMS_TO_TICKS(10));
-
-  send_command_(ST7789_DISPON);
-  vTaskDelay(pdMS_TO_TICKS(100));
+  esp_lcd_panel_invert_color(panel_handle_, true);      // matches TFT_INVERSION_ON
+  esp_lcd_panel_set_gap(panel_handle_, COL_OFFSET, 0);  // CGRAM_OFFSET: shift columns +35
 
   ESP_LOGI(TAG, "T-Display-S3 ready (%dx%d, col_offset=%d)", width_, height_, COL_OFFSET);
 
-  // Hardware test: push solid green immediately after init.
-  // If the display shows green on boot, the hardware path is working.
+  // Boot test: green frame for 500ms. If visible, the full path works.
   for (size_t i = 0; i < (size_t)width_ * height_; i++)
-    fb_[i] = 0x07E0;  // RGB565 green (no byte-swap needed here; swap_color_bytes handles it)
+    fb_[i] = 0x07E0;
   push_frame_();
   vTaskDelay(pdMS_TO_TICKS(500));
   memset(fb_, 0, fb_bytes);
+}
+
+void TDisplayS3::push_frame_() {
+  // draw_bitmap applies the gap offset (COL_OFFSET) automatically via set_gap()
+  esp_err_t ret = esp_lcd_panel_draw_bitmap(panel_handle_, 0, 0, (int)width_, (int)height_, fb_);
+  if (ret != ESP_OK)
+    ESP_LOGE(TAG, "draw_bitmap failed: %s", esp_err_to_name(ret));
 }
 
 void TDisplayS3::dump_config() {
@@ -202,17 +134,9 @@ void TDisplayS3::draw_absolute_pixel_internal(int x, int y, Color color) {
 
 void TDisplayS3::update() {
   this->do_update_();
-  if (!io_handle_)
+  if (!panel_handle_)
     return;
   push_frame_();
-}
-
-void TDisplayS3::send_command_(uint8_t cmd) {
-  esp_lcd_panel_io_tx_param(io_handle_, cmd, nullptr, 0);
-}
-
-void TDisplayS3::send_command_data_(uint8_t cmd, const uint8_t *data, size_t len) {
-  esp_lcd_panel_io_tx_param(io_handle_, cmd, data, len);
 }
 
 }  // namespace tdisplays3

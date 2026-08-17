@@ -4,6 +4,8 @@
 #include "esphome/components/display/display_buffer.h"
 
 #include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_panel_ops.h"
 #include "driver/gpio.h"
 #include "esp_heap_caps.h"
 
@@ -29,20 +31,19 @@ class TDisplayS3 : public display::DisplayBuffer {
   }
 
  protected:
-  void send_command_(uint8_t cmd);
-  void send_command_data_(uint8_t cmd, const uint8_t *data, size_t len);
   void push_frame_();
 
-  esp_lcd_i80_bus_handle_t i80_bus_{nullptr};
+  esp_lcd_i80_bus_handle_t  i80_bus_{nullptr};
   esp_lcd_panel_io_handle_t io_handle_{nullptr};
+  esp_lcd_panel_handle_t    panel_handle_{nullptr};
   uint16_t *fb_{nullptr};
   uint16_t width_{170};
   uint16_t height_{320};
 
-  // Column offset: ST7789V controller is 240 wide, panel is 170 wide
+  // Column offset: ST7789V controller is 240 wide, visible panel is 170 wide
   static constexpr int COL_OFFSET = 35;
 
-  // Fixed hardware pins for T-Display-S3 parallel interface
+  // Fixed hardware pins for T-Display-S3 8-bit parallel interface
   static constexpr int WR_PIN  = 8;
   static constexpr int RD_PIN  = 9;
   static constexpr int RST_PIN = 5;
