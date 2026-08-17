@@ -3,6 +3,116 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_rom_sys.h"
+
+// ---------------------------------------------------------------------------
+// Bit-bang diagnostic: raw GPIO I80 write, no LCD_CAM peripheral involved.
+// Runs once at boot before the LCD_CAM is touched. Answers: "is the
+// hardware physically reachable?" If the screen shows green during the 2-s
+// hold, the hardware works and the LCD_CAM config is the bug. If nothing
+// appears, the hardware (FPC, panel, chip) is broken.
+// ---------------------------------------------------------------------------
+namespace {
+
+static void bb_write_byte(uint8_t b) {
+    gpio_set_level(GPIO_NUM_39, (b >> 0) & 1);
+    gpio_set_level(GPIO_NUM_40, (b >> 1) & 1);
+    gpio_set_level(GPIO_NUM_41, (b >> 2) & 1);
+    gpio_set_level(GPIO_NUM_42, (b >> 3) & 1);
+    gpio_set_level(GPIO_NUM_45, (b >> 4) & 1);
+    gpio_set_level(GPIO_NUM_46, (b >> 5) & 1);
+    gpio_set_level(GPIO_NUM_47, (b >> 6) & 1);
+    gpio_set_level(GPIO_NUM_48, (b >> 7) & 1);
+    gpio_set_level(GPIO_NUM_8, 0);    // WR LOW
+    esp_rom_delay_us(1);
+    gpio_set_level(GPIO_NUM_8, 1);    // WR HIGH
+    esp_rom_delay_us(1);
+}
+
+static void bb_cmd(uint8_t cmd) {
+    gpio_set_level(GPIO_NUM_6, 0);    // CS LOW
+    gpio_set_level(GPIO_NUM_7, 0);    // DC LOW (command)
+    bb_write_byte(cmd);
+    gpio_set_level(GPIO_NUM_6, 1);    // CS HIGH
+}
+
+static void bb_data(const uint8_t *data, size_t len) {
+    gpio_set_level(GPIO_NUM_6, 0);    // CS LOW
+    gpio_set_level(GPIO_NUM_7, 1);    // DC HIGH (data)
+    for (size_t i = 0; i < len; i++) bb_write_byte(data[i]);
+    gpio_set_level(GPIO_NUM_6, 1);    // CS HIGH
+}
+
+static void bit_bang_test() {
+    ESP_LOGI("bb", "Bit-bang diagnostic: plain GPIO, no LCD_CAM");
+
+    // All I80 + control pins as plain GPIO outputs
+    const gpio_num_t PINS[] = {
+        GPIO_NUM_5, GPIO_NUM_6, GPIO_NUM_7, GPIO_NUM_8, GPIO_NUM_9,
+        GPIO_NUM_39, GPIO_NUM_40, GPIO_NUM_41, GPIO_NUM_42,
+        GPIO_NUM_45, GPIO_NUM_46, GPIO_NUM_47, GPIO_NUM_48,
+    };
+    uint64_t mask = 0;
+    for (gpio_num_t p : PINS) mask |= 1ULL << (int)p;
+    gpio_config_t cfg = {};
+    cfg.pin_bit_mask = mask;
+    cfg.mode = GPIO_MODE_OUTPUT;
+    gpio_config(&cfg);
+
+    gpio_set_level(GPIO_NUM_5, 1);    // RST HIGH
+    gpio_set_level(GPIO_NUM_6, 1);    // CS HIGH
+    gpio_set_level(GPIO_NUM_7, 1);    // DC HIGH
+    gpio_set_level(GPIO_NUM_8, 1);    // WR HIGH (idle)
+    gpio_set_level(GPIO_NUM_9, 1);    // RD HIGH
+
+    // Hardware reset
+    gpio_set_level(GPIO_NUM_5, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    gpio_set_level(GPIO_NUM_5, 1);
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    // Full ST7789V init — no INVON so green fills as true green
+    bb_cmd(0x01); vTaskDelay(pdMS_TO_TICKS(150));          // SWRESET
+    bb_cmd(0x11); vTaskDelay(pdMS_TO_TICKS(120));          // SLPOUT
+    { uint8_t d[] = {0x55}; bb_cmd(0x3A); bb_data(d,1); } // COLMOD 16-bit
+    vTaskDelay(pdMS_TO_TICKS(10));
+    { uint8_t d[] = {0x00}; bb_cmd(0x36); bb_data(d,1); } // MADCTL
+    { uint8_t d[] = {0x0C,0x0C,0x00,0x33,0x33}; bb_cmd(0xB2); bb_data(d,5); }
+    { uint8_t d[] = {0x35}; bb_cmd(0xB7); bb_data(d,1); }
+    { uint8_t d[] = {0x1A}; bb_cmd(0xBB); bb_data(d,1); }
+    { uint8_t d[] = {0x2C}; bb_cmd(0xC0); bb_data(d,1); }
+    { uint8_t d[] = {0x01}; bb_cmd(0xC2); bb_data(d,1); }
+    { uint8_t d[] = {0x12}; bb_cmd(0xC3); bb_data(d,1); }
+    { uint8_t d[] = {0x20}; bb_cmd(0xC4); bb_data(d,1); }
+    { uint8_t d[] = {0x0F}; bb_cmd(0xC6); bb_data(d,1); }
+    { uint8_t d[] = {0xA4,0xA1}; bb_cmd(0xD0); bb_data(d,2); }
+    { uint8_t d[] = {0xD0,0x04,0x0D,0x11,0x13,0x2B,0x3F,
+                     0x54,0x4C,0x18,0x0D,0x0B,0x1F,0x23};
+      bb_cmd(0xE0); bb_data(d,14); }
+    { uint8_t d[] = {0xD0,0x04,0x0C,0x11,0x13,0x2C,0x3F,
+                     0x44,0x51,0x2F,0x1F,0x1F,0x20,0x23};
+      bb_cmd(0xE1); bb_data(d,14); }
+    bb_cmd(0x29); vTaskDelay(pdMS_TO_TICKS(10));           // DISPON
+
+    // Cover ALL 240 controller columns so col_offset uncertainty doesn't hide the result
+    { uint8_t d[] = {0x00,0x00,0x00,0xEF}; bb_cmd(0x2A); bb_data(d,4); } // CASET 0-239
+    { uint8_t d[] = {0x00,0x00,0x01,0x3F}; bb_cmd(0x2B); bb_data(d,4); } // RASET 0-319
+    bb_cmd(0x2C);  // RAMWR
+
+    // Fill 240x320 pixels GREEN (RGB565 0x07E0 big-endian: 0x07, 0xE0)
+    gpio_set_level(GPIO_NUM_6, 0);    // CS LOW
+    gpio_set_level(GPIO_NUM_7, 1);    // DC HIGH
+    for (int i = 0; i < 240 * 320; i++) {
+        bb_write_byte(0x07);
+        bb_write_byte(0xE0);
+    }
+    gpio_set_level(GPIO_NUM_6, 1);    // CS HIGH
+
+    ESP_LOGI("bb", "Bit-bang fill done — holding 2s. Did you see GREEN?");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+}
+
+}  // namespace
 
 namespace esphome {
 namespace tdisplays3 {
@@ -78,6 +188,10 @@ void TDisplayS3::init_lcd_() {
 }
 
 void TDisplayS3::setup() {
+  // Diagnostic: raw GPIO bit-bang — proves hardware connectivity independent of LCD_CAM.
+  // Watch for GREEN on screen during the ~2s hold. See log for "Did you see GREEN?".
+  bit_bang_test();
+
   size_t fb_bytes = (size_t)width_ * height_ * sizeof(uint16_t);
 
   fb_ = (uint16_t *)heap_caps_malloc(fb_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
