@@ -65,6 +65,21 @@ static void bit_bang_test() {
     gpio_set_level(GPIO_NUM_8, 1);    // WR HIGH (idle)
     gpio_set_level(GPIO_NUM_9, 1);    // RD HIGH
 
+    // Verify GPIO output register is being set correctly.
+    // gpio_get_level() on an output-mode pin reads the output register.
+    // If these log 1/1/0/1, the ESP32 side is correct — problem is the physical trace.
+    // If any log wrong values, there is a GPIO driver issue.
+    gpio_set_level(GPIO_NUM_39, 1);
+    gpio_set_level(GPIO_NUM_48, 1);
+    gpio_set_level(GPIO_NUM_8,  0);  // WR LOW for contrast
+    ESP_LOGI("bb", "GPIO register check: D0(GPIO39)=%d D7(GPIO48)=%d WR(GPIO8)=%d [expected 1,1,0]",
+             gpio_get_level(GPIO_NUM_39),
+             gpio_get_level(GPIO_NUM_48),
+             gpio_get_level(GPIO_NUM_8));
+    gpio_set_level(GPIO_NUM_39, 0);
+    gpio_set_level(GPIO_NUM_48, 0);
+    gpio_set_level(GPIO_NUM_8,  1);
+
     // Hardware reset
     gpio_set_level(GPIO_NUM_5, 0);
     vTaskDelay(pdMS_TO_TICKS(20));
