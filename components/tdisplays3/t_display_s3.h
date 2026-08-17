@@ -32,6 +32,9 @@ class TDisplayS3 : public display::DisplayBuffer {
 
  protected:
   void push_frame_();
+  void init_lcd_();
+  void send_cmd_(uint8_t cmd);
+  void send_cmd_data_(uint8_t cmd, const uint8_t *data, size_t len);
 
   esp_lcd_i80_bus_handle_t  i80_bus_{nullptr};
   esp_lcd_panel_io_handle_t io_handle_{nullptr};

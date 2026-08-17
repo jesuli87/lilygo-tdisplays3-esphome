@@ -11,6 +11,72 @@ static const char *const TAG = "TDisplayS3";
 
 constexpr int TDisplayS3::DATA_PINS[8];
 
+void TDisplayS3::send_cmd_(uint8_t cmd) {
+  esp_lcd_panel_io_tx_param(io_handle_, cmd, NULL, 0);
+}
+
+void TDisplayS3::send_cmd_data_(uint8_t cmd, const uint8_t *data, size_t len) {
+  esp_lcd_panel_io_tx_param(io_handle_, cmd, data, len);
+}
+
+void TDisplayS3::init_lcd_() {
+  // Full ST7789V init matching TFT_eSPI's sequence for T-Display-S3.
+  // The generic ESP-IDF vendor driver omits the power control and gamma
+  // registers, leaving AVDD/AVEE/VGH/VGL at post-reset defaults that are
+  // often insufficient for the LC drive voltage this panel requires.
+  send_cmd_(0x01);                                     // SWRESET
+  vTaskDelay(pdMS_TO_TICKS(150));
+
+  send_cmd_(0x11);                                     // SLPOUT
+  vTaskDelay(pdMS_TO_TICKS(120));
+
+  { uint8_t d[] = {0x55};
+    send_cmd_data_(0x3A, d, sizeof d); }               // COLMOD: 16-bit RGB565
+  vTaskDelay(pdMS_TO_TICKS(10));
+
+  { uint8_t d[] = {0x00};
+    send_cmd_data_(0x36, d, sizeof d); }               // MADCTL: portrait, RGB order
+
+  { uint8_t d[] = {0x0C, 0x0C, 0x00, 0x33, 0x33};
+    send_cmd_data_(0xB2, d, sizeof d); }               // PORCTR: frame rate 60 Hz
+
+  { uint8_t d[] = {0x35};
+    send_cmd_data_(0xB7, d, sizeof d); }               // GCTRL
+
+  { uint8_t d[] = {0x1A};
+    send_cmd_data_(0xBB, d, sizeof d); }               // VCOMS = 0.9 V
+
+  { uint8_t d[] = {0x2C};
+    send_cmd_data_(0xC0, d, sizeof d); }               // LCMCTRL
+
+  { uint8_t d[] = {0x01};
+    send_cmd_data_(0xC2, d, sizeof d); }               // VDVVRHEN
+
+  { uint8_t d[] = {0x12};
+    send_cmd_data_(0xC3, d, sizeof d); }               // VRHS = 4.45 V
+
+  { uint8_t d[] = {0x20};
+    send_cmd_data_(0xC4, d, sizeof d); }               // VDV = 0 V
+
+  { uint8_t d[] = {0x0F};
+    send_cmd_data_(0xC6, d, sizeof d); }               // FRCTRL2 = 60 Hz
+
+  { uint8_t d[] = {0xA4, 0xA1};
+    send_cmd_data_(0xD0, d, sizeof d); }               // PWCTRL1: AVDD=6.8V AVEE=-6.8V
+
+  { uint8_t d[] = {0xD0, 0x04, 0x0D, 0x11, 0x13, 0x2B, 0x3F,
+                   0x54, 0x4C, 0x18, 0x0D, 0x0B, 0x1F, 0x23};
+    send_cmd_data_(0xE0, d, sizeof d); }               // PVGAMCTRL
+
+  { uint8_t d[] = {0xD0, 0x04, 0x0C, 0x11, 0x13, 0x2C, 0x3F,
+                   0x44, 0x51, 0x2F, 0x1F, 0x1F, 0x20, 0x23};
+    send_cmd_data_(0xE1, d, sizeof d); }               // NVGAMCTRL
+
+  send_cmd_(0x21);                                     // INVON: colour inversion
+  send_cmd_(0x29);                                     // DISPON
+  vTaskDelay(pdMS_TO_TICKS(10));
+}
+
 void TDisplayS3::setup() {
   size_t fb_bytes = (size_t)width_ * height_ * sizeof(uint16_t);
 
@@ -60,7 +126,7 @@ void TDisplayS3::setup() {
   // Panel IO
   esp_lcd_panel_io_i80_config_t io_cfg = {};
   io_cfg.cs_gpio_num              = CS_PIN;
-  io_cfg.pclk_hz                  = 10 * 1000 * 1000;  // 10 MHz (within ST7789V 66ns cycle spec)
+  io_cfg.pclk_hz                  = 4 * 1000 * 1000;   // 4 MHz: conservative for signal integrity
   io_cfg.trans_queue_depth        = 10;
   io_cfg.lcd_cmd_bits             = 8;
   io_cfg.lcd_param_bits           = 8;
@@ -73,10 +139,11 @@ void TDisplayS3::setup() {
     return;
   }
 
-  // ST7789 vendor panel driver — handles reset timing, SWRESET/SLPOUT/COLMOD/MADCTL/DISPON
+  // Vendor panel driver: used for RST GPIO management and draw_bitmap.
+  // We bypass panel_init() and send the full init sequence ourselves.
   esp_lcd_panel_dev_config_t panel_cfg = {};
   panel_cfg.reset_gpio_num  = RST_PIN;
-  panel_cfg.rgb_endian      = LCD_RGB_ENDIAN_RGB;  // matches TFT_RGB_ORDER=TFT_RGB
+  panel_cfg.rgb_endian      = LCD_RGB_ENDIAN_RGB;
   panel_cfg.bits_per_pixel  = 16;
 
   err = esp_lcd_new_panel_st7789(io_handle_, &panel_cfg, &panel_handle_);
@@ -86,12 +153,16 @@ void TDisplayS3::setup() {
     return;
   }
 
-  // Bring up the display
-  esp_lcd_panel_reset(panel_handle_);   // RST LOW→HIGH + stabilisation
-  esp_lcd_panel_init(panel_handle_);    // SWRESET→SLPOUT→COLMOD→MADCTL→DISPON (with proper delays)
+  // Hardware reset via RST pin, then wait for controller to stabilise
+  esp_lcd_panel_reset(panel_handle_);
+  vTaskDelay(pdMS_TO_TICKS(120));
 
-  esp_lcd_panel_invert_color(panel_handle_, true);      // matches TFT_INVERSION_ON
-  esp_lcd_panel_set_gap(panel_handle_, COL_OFFSET, 0);  // CGRAM_OFFSET: shift columns +35
+  // Full init: power control + gamma registers that the generic vendor driver omits.
+  // Without PWCTRL1/VCOMS/VRHS the LC drive voltages stay at post-reset defaults
+  // which are often too low for this panel to display anything.
+  init_lcd_();
+
+  esp_lcd_panel_set_gap(panel_handle_, COL_OFFSET, 0);  // CGRAM shift: 240-wide ctrl → 170-wide panel
 
   ESP_LOGI(TAG, "T-Display-S3 ready (%dx%d, col_offset=%d)", width_, height_, COL_OFFSET);
 
