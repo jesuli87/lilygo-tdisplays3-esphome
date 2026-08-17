@@ -188,6 +188,14 @@ void TDisplayS3::init_lcd_() {
 }
 
 void TDisplayS3::setup() {
+  // Force GPIO15 (display power enable) HIGH before anything else.
+  // RESTORE_DEFAULT_ON restores NVS-saved state, which may be OFF if the switch
+  // was ever turned off. The ST7789V has no power when GPIO15 is LOW.
+  gpio_set_direction(GPIO_NUM_15, GPIO_MODE_OUTPUT);
+  gpio_set_level(GPIO_NUM_15, 1);
+  vTaskDelay(pdMS_TO_TICKS(100));  // Power rail stabilisation
+  ESP_LOGI(TAG, "GPIO15 (power_en) forced HIGH, waiting for power rail");
+
   // Diagnostic: raw GPIO bit-bang — proves hardware connectivity independent of LCD_CAM.
   // Watch for GREEN on screen during the ~2s hold. See log for "Did you see GREEN?".
   bit_bang_test();
